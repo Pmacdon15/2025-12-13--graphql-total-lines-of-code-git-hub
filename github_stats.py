@@ -197,19 +197,6 @@ def main():
         created_at_dt = datetime.fromisoformat(created_at_str.replace("Z", "+00:00"))
         time_on_github = datetime.now(timezone.utc) - created_at_dt
         
-        summary_text = Text.assemble(
-            Text(f"User Since: {created_at_dt.strftime('%B %d, %Y')}", style="bold"),
-            f" (~{time_on_github.days // 365} years, { (time_on_github.days % 365) // 30} months)\n",
-            Text(f"Followers: {summary_stats['followers']}", style="bold"), " | ",
-            Text(f"Following: {summary_stats['following']}\n", style="bold"),
-            Text(f"Total Public Repositories: {summary_stats['repos']}", style="bold"),
-            "\n",
-            Text(f"Total Pull Requests: {summary_stats['prs']}", style="bold"),
-            "\n",
-            Text(f"Total Issues: {summary_stats['issues']}", style="bold"),
-        )
-        console.print(Panel(summary_text, title="[bold]Quick Summary[/bold]", border_style="green"))
-        
         console.print("\n[cyan]Now starting detailed analysis (this may take a while)...[/cyan]")
 
         with console.status("[bold green]Fetching repositories & languages...[/]"):
@@ -291,6 +278,20 @@ def main():
         ])
         
         console.print(Panel(Text.assemble(*detailed_text_parts), title="[bold]Detailed Code Stats[/bold]", border_style="blue"))
+
+        # Display Quick Summary Stats (now at the end)
+        summary_text = Text.assemble(
+            Text(f"User Since: {created_at_dt.strftime('%B %d, %Y')}", style="bold bright_blue"),
+            f" (~{time_on_github.days // 365} years, { (time_on_github.days % 365) // 30} months)\n",
+            Text(f"Followers: {summary_stats['followers']}", style="bold bright_magenta"), " | ",
+            Text(f"Following: {summary_stats['following']}\n", style="bold bright_magenta"),
+            Text(f"Total Public Repositories: {summary_stats['repos']}", style="bold bright_yellow"),
+            "\n",
+            Text(f"Total Pull Requests: {summary_stats['prs']}", style="bold bright_cyan"),
+            "\n",
+            Text(f"Total Issues: {summary_stats['issues']}", style="bold bright_red"),
+        )
+        console.print(Panel(summary_text, title="[bold]Quick Summary[/bold]", border_style="green"))
 
     except requests.exceptions.HTTPError as e:
         console.print(f"[bold red]Error:[/bold red] Failed to fetch data from GitHub. Status code: {e.response.status_code}")
