@@ -3,10 +3,12 @@ import getpass
 import requests
 from datetime import datetime, timezone
 from rich.console import Console
-from rich.progress import Progress
+from rich.progress import Progress, track
 from rich.panel import Panel
 from rich.text import Text
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
+from itertools import repeat
 
 load_dotenv()
 
@@ -34,7 +36,7 @@ query GetUserSummary($username: String!) {
     following {
       totalCount
     }
-    repositories(ownerAffiliations: OWNER, isFork: false) {
+    repositories(ownerAffiliations: OWNER, isFork: false, privacy: PUBLIC) {
       totalCount
     }
     pullRequests {
@@ -50,7 +52,7 @@ query GetUserSummary($username: String!) {
 GET_REPOSITORIES_QUERY = """
 query GetRepositories($username: String!, $cursor: String) {
   user(login: $username) {
-    repositories(first: 100, after: $cursor, ownerAffiliations: OWNER, isFork: false, orderBy: {field: PUSHED_AT, direction: DESC}) {
+    repositories(first: 100, after: $cursor, ownerAffiliations: OWNER, isFork: false, privacy: PUBLIC, orderBy: {field: PUSHED_AT, direction: DESC}) {
       pageInfo {
         endCursor
         hasNextPage
@@ -138,30 +140,37 @@ def get_commit_stats(owner, name, token, author_id):
     cursor = None
     has_next_page = True
     while has_next_page:
-        variables = {"owner": owner, "name": name, "cursor": cursor, "authorId": author_id}
-        data = graphql_request(GET_COMMITS_QUERY, variables, token)
-        
-        repo = data.get("data", {}).get("repository")
-        if not repo or not repo.get("defaultBranchRef") or not repo["defaultBranchRef"].get("target"):
-            break 
+        try:
+            variables = {"owner": owner, "name": name, "cursor": cursor, "authorId": author_id}
+            data = graphql_request(GET_COMMITS_QUERY, variables, token)
             
-        history = repo["defaultBranchRef"]["target"]["history"]
-        commits = history.get("nodes", [])
-        total_commits += len(commits)
-        
-        for commit in commits:
-            total_additions += commit.get("additions", 0)
-            total_deletions += commit.get("deletions", 0)
-            commit_date = datetime.fromisoformat(commit["committedDate"].replace("Z", "+00:00"))
-            
-            if earliest_date is None or commit_date < earliest_date:
-                earliest_date = commit_date
-            if latest_date is None or commit_date > latest_date:
-                latest_date = commit_date
+            repo = data.get("data", {}).get("repository")
+            if not repo or not repo.get("defaultBranchRef") or not repo["defaultBranchRef"].get("target"):
+                break 
+                
+            history = repo["defaultBranchRef"]["target"]["history"]
+            commits = history.get("nodes", [])
+            if not commits:
+                break
 
-        page_info = history.get("pageInfo", {})
-        cursor = page_info.get("endCursor")
-        has_next_page = page_info.get("hasNextPage", False)
+            total_commits += len(commits)
+            
+            for commit in commits:
+                total_additions += commit.get("additions", 0)
+                total_deletions += commit.get("deletions", 0)
+                commit_date = datetime.fromisoformat(commit["committedDate"].replace("Z", "+00:00"))
+                
+                if earliest_date is None or commit_date < earliest_date:
+                    earliest_date = commit_date
+                if latest_date is None or commit_date > latest_date:
+                    latest_date = commit_date
+
+            page_info = history.get("pageInfo", {})
+            cursor = page_info.get("endCursor")
+            has_next_page = page_info.get("hasNextPage", False)
+        except Exception:
+            # Ignore errors for single repo analysis (e.g., empty repo)
+            has_next_page = False
         
     return total_additions, total_deletions, total_commits, earliest_date, latest_date
 
@@ -193,7 +202,7 @@ def main():
             f" (~{time_on_github.days // 365} years, { (time_on_github.days % 365) // 30} months)\n",
             Text(f"Followers: {summary_stats['followers']}", style="bold"), " | ",
             Text(f"Following: {summary_stats['following']}\n", style="bold"),
-            Text(f"Total Repositories: {summary_stats['repos']}", style="bold"),
+            Text(f"Total Public Repositories: {summary_stats['repos']}", style="bold"),
             "\n",
             Text(f"Total Pull Requests: {summary_stats['prs']}", style="bold"),
             "\n",
@@ -203,40 +212,39 @@ def main():
         
         console.print("\n[cyan]Now starting detailed analysis (this may take a while)...[/cyan]")
 
+        with console.status("[bold green]Fetching repositories & languages...[/]"):
+            repositories = get_all_repositories(username, token)
+        console.print(f"[green]Found {len(repositories)} public repositories to analyze.[/green]")
+        
         language_stats = {}
         total_lang_size = 0
+        for repo in repositories:
+            if not repo or not repo.get('languages'): continue
+            for lang_edge in repo['languages']['edges']:
+                node = lang_edge['node']
+                if not node: continue
+                lang_name = node['name']
+                lang_color = node.get('color', 'white')
+                lang_size = lang_edge['size']
+                total_lang_size += lang_size
+                if lang_name in language_stats:
+                    language_stats[lang_name]['size'] += lang_size
+                else:
+                    language_stats[lang_name] = {'size': lang_size, 'color': lang_color}
+        
+        most_popular_repo = max(repositories, key=lambda r: r['stargazerCount']) if repositories else None
 
-        with Progress(console=console) as progress:
-            repo_task = progress.add_task("[cyan]Fetching repositories & languages...", total=None)
-            repositories = get_all_repositories(username, token)
-            progress.update(repo_task, completed=len(repositories), total=len(repositories), description=f"[green]Found {len(repositories)} repositories to analyze.")
+        total_additions, total_deletions, total_commits = 0, 0, 0
+        first_commit_date, latest_commit_date = None, None
+        
+        owners = [repo["owner"]["login"] for repo in repositories]
+        names = [repo["name"] for repo in repositories]
 
-            for repo in repositories:
-                if not repo or not repo.get('languages'): continue
-                for lang_edge in repo['languages']['edges']:
-                    node = lang_edge['node']
-                    if not node: continue
-                    lang_name = node['name']
-                    lang_color = node.get('color', 'white')
-                    lang_size = lang_edge['size']
-                    total_lang_size += lang_size
-                    if lang_name in language_stats:
-                        language_stats[lang_name]['size'] += lang_size
-                    else:
-                        language_stats[lang_name] = {'size': lang_size, 'color': lang_color}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            results = executor.map(get_commit_stats, owners, names, repeat(token), repeat(author_id))
             
-            most_popular_repo = max(repositories, key=lambda r: r['stargazerCount']) if repositories else None
-
-            total_additions, total_deletions, total_commits = 0, 0, 0
-            first_commit_date, latest_commit_date = None, None
-
-            commit_task = progress.add_task("[cyan]Analyzing your commits...", total=len(repositories))
-            for repo in repositories:
-                if not repo: continue
-                owner = repo["owner"]["login"]
-                name = repo["name"]
-                
-                add, dele, com, earliest, latest = get_commit_stats(owner, name, token, author_id)
+            for result in track(results, console=console, total=len(repositories), description="[cyan]Analyzing your commits...    "):
+                add, dele, com, earliest, latest = result
                 total_additions += add
                 total_deletions += dele
                 total_commits += com
@@ -245,19 +253,15 @@ def main():
                     first_commit_date = earliest
                 if latest and (latest_commit_date is None or latest > latest_commit_date):
                     latest_commit_date = latest
-                
-                progress.update(commit_task, advance=1, description=f"[cyan]Analyzed your commits in [bold]{owner}/{name}[/bold]")
 
         # Display Language Stats
         sorted_languages = sorted(language_stats.items(), key=lambda item: item[1]['size'], reverse=True)
         lang_text_parts = []
-        for lang, data in sorted_languages[:7]: # Show top 7
-            percentage = (data['size'] / total_lang_size) * 100 if total_lang_size > 0 else 0
-            lang_text_parts.append(Text(f"● {lang}: {percentage:.2f}%\n", style=data['color']))
-        
-        if lang_text_parts:
+        if sorted_languages:
+            for lang, data in sorted_languages[:7]: # Show top 7
+                percentage = (data['size'] / total_lang_size) * 100 if total_lang_size > 0 else 0
+                lang_text_parts.append(Text(f"● {lang}: {percentage:.2f}%\n", style=data['color']))
             console.print(Panel(Text.assemble(*lang_text_parts), title="[bold]Language Breakdown[/bold]", border_style="magenta"))
-
 
         # Display Detailed Code Stats
         coding_lifespan = latest_commit_date - first_commit_date if first_commit_date and latest_commit_date else None
@@ -279,7 +283,7 @@ def main():
             detailed_text_parts.append(f"Coding Lifespan: {coding_lifespan.days // 365} years, {(coding_lifespan.days % 365) // 30} months\n")
 
         detailed_text_parts.extend([
-            Text(f"Your Total Commits Analyzed: {total_commits}", style="bold yellow"),
+            Text(f"Your Total Commits: {total_commits}", style="bold yellow"),
             "\n",
             Text(f"Your Total Lines Added: {total_additions}", style="bold green"),
             "\n",
